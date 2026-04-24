@@ -37,7 +37,7 @@ load_dotenv(os.path.join(_BASE_DIR, "gmcp", ".env"), override=False)
 MONDAY_API_KEY = os.getenv("MONDAY_API_KEY", "")
 MONDAY_WORKSPACE_ID = os.getenv("MONDAY_WORKSPACE_ID", "")
 MONDAY_WORKSPACE_NAME = os.getenv("MONDAY_WORKSPACE_NAME", "")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "C0AU9FA76EB")
 SLACK_NOTIFY_USER = "U08UV06KD45"
@@ -528,7 +528,7 @@ def generate_proposal(deal):
 # ══════════════════════════════════════════════════════════════
 
 def _get_google_tools():
-    sys.path.insert(0, os.path.join(_BASE_DIR, "gmcp"))
+    sys.path.insert(0, _BASE_DIR)
     from google_tools import drive_create_file, drive_upload_file, gmail_create_draft
     return drive_create_file, drive_upload_file, gmail_create_draft
 
