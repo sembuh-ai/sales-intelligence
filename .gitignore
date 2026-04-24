@@ -2,3 +2,6 @@
 *.json
 */venv
 .claude
+service_account
+output
+venv
