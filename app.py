@@ -20,6 +20,7 @@ import datetime
 import json
 import os
 import re
+import sqlite3
 import sys
 from contextlib import AsyncExitStack
 
@@ -39,12 +40,14 @@ MONDAY_WORKSPACE_ID = os.getenv("MONDAY_WORKSPACE_ID", "")
 MONDAY_WORKSPACE_NAME = os.getenv("MONDAY_WORKSPACE_NAME", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-6")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
-SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "C0AU9FA76EB")
+SLACK_CHANNEL_BOD = "C0AUZ7GB3DJ"   # #bod-updates
+SLACK_CHANNEL_AM = "C0AUE6XG8TZ"    # #am-indi
 SLACK_NOTIFY_USER = "U08UV06KD45"
 GOOGLE_FOLDER_ID = os.getenv("FOLDER_ID", "")
 
 MONDAY_API_URL = "https://api.monday.com/v2"
 SLACK_API_URL = "https://slack.com/api"
+DB_PATH = os.path.join(_BASE_DIR, "sales_intelligence.db")
 
 TEMPLATE_DIR = os.path.join(_BASE_DIR, "PTP Hackathon - Brief")
 OUTPUT_DIR = os.path.join(_BASE_DIR, "output")
@@ -139,7 +142,7 @@ def fetch_deals(board_id):
         boards(ids: $boardId) {
             items_page(limit: 100) {
                 items {
-                    id name
+                    id name updated_at
                     column_values { id type text value }
                 }
             }
@@ -150,7 +153,7 @@ def fetch_deals(board_id):
     items = data["boards"][0]["items_page"]["items"]
     deals = []
     for item in items:
-        deal = {"id": item["id"], "name": item["name"]}
+        deal = {"id": item["id"], "name": item["name"], "updated_at": item.get("updated_at", "")}
         for col in item["column_values"]:
             deal[col["id"]] = col.get("text", "") or ""
             deal[f"{col['id']}_raw"] = col.get("value", "")
@@ -171,6 +174,9 @@ def parse_deal(deal):
     incurred = _parse_num(deal.get("numeric_mm1bdpzy", "0"))
     excess = _parse_num(deal.get("numeric_mm1bkxy8", "0"))
     approved = _parse_num(deal.get("numeric_mm1b64b7", "0"))
+    # Last interaction date (date__1) or fall back to Monday item updated_at
+    last_contact = deal.get("date__1", "") or ""
+    updated_at = deal.get("updated_at", "")
 
     products = detect_products(name)
 
@@ -195,6 +201,7 @@ def parse_deal(deal):
         "members_covered": members_covered, "pricing_model": pricing_model or "Per Claim",
         "incurred": incurred, "excess": excess, "approved": approved,
         "owner": owner, "proposal_date": proposal_date, "products": products,
+        "last_contact": last_contact, "updated_at": updated_at,
     }
 
 
@@ -295,85 +302,155 @@ def _unmerge_and_clear(ws):
             cell.value = None
 
 
-def generate_quotation(deal, seq_num=1):
+def generate_quotation(deal, seq_num=1, discount_pct=0, discount_note="", client_contact_name="", client_contact_title="", mom_context=""):
+    """Generate quotation from Quotation-Sentosa-Health-Demo template.
+    Yellow cells = dynamic values from Monday CRM and MoM.
+    """
     import openpyxl
 
-    template_path = os.path.join(TEMPLATE_DIR, "Sembuh AI_Quotation Template.xlsx")
+    template_path = os.path.join(TEMPLATE_DIR, "Quotation-Sentosa-Health-Demo.xlsx")
     wb = openpyxl.load_workbook(template_path)
     ws = wb.active
 
     client_name = deal["name"]
     q_number = f"SBH-Q-{TODAY.year}-{seq_num:03d}"
     validity_date = (TODAY + datetime.timedelta(days=30)).strftime("%d %B %Y")
-
     products = deal["products"]
-    line_items = []
-    total_revenue = 0
-    for prod_name in products:
-        info = MARGIN_ASSUMPTIONS[prod_name]
-        vol = 1 if prod_name == "Implementation" else (deal["annual_claim_vol"] or deal["monthly_claim_vol"] * 12)
-        revenue = info["unit_price"] * vol
-        total_revenue += revenue
-        line_items.append({
-            "product": prod_name, "type": info["type"],
-            "unit_price": info["unit_price"], "volume": vol,
-            "uom": info["uom"], "revenue": revenue,
-        })
+    products_str = ", ".join(products)
+    monthly_vol = int(deal["monthly_claim_vol"] or 0)
+    annual_vol = int(deal["annual_claim_vol"] or monthly_vol * 12)
+    members = int(deal["members_covered"] or monthly_vol * 10)
+    fx = 16000
+    ip_ratio = 0.30
+    op_ratio = 0.70
 
-    _unmerge_and_clear(ws)
+    # Product monthly IDR costs (from MARGIN_ASSUMPTIONS, converted)
+    has_ocr = "Claim Workflow" in products
+    has_fwa = "Fraud Detection" in products
+    has_stp = "STP" in products or ("Claim Workflow" in products and "Fraud Detection" in products)
+    has_impl = "Implementation" in products
 
-    ws["A1"] = "SEMBUH AI — QUOTATION"
-    ws["A3"], ws["B3"] = "Client:", client_name
-    ws["A4"], ws["B4"] = "Date:", TODAY_STR
-    ws["A5"], ws["B5"] = "Quotation No:", q_number
-    ws["A6"], ws["B6"] = "Validity:", f"30 days (until {validity_date})"
-    ws["A7"], ws["B7"] = "Pricing Model:", deal["pricing_model"]
+    ocr_monthly = MARGIN_ASSUMPTIONS["Claim Workflow"]["unit_price"] * monthly_vol * fx if has_ocr else 0
+    fwa_monthly = MARGIN_ASSUMPTIONS["Fraud Detection"]["unit_price"] * monthly_vol * fx if has_fwa else 0
+    stp_monthly = 0.5 * monthly_vol * fx if has_stp else 0  # ~$0.50/claim for STP
+    impl_fee = MARGIN_ASSUMPTIONS["Implementation"]["unit_price"] * fx if has_impl else 35000000
 
-    for col, hdr in enumerate(["No", "Product / Service", "Type", "Unit Price ($)", "Volume", "UoM", "Total ($)"]):
-        ws.cell(row=9, column=col + 1, value=hdr)
+    # Prepared for name
+    prepared_for_name = client_contact_name or client_name
+    if client_contact_title:
+        prepared_for_name = f"{prepared_for_name} | {client_name}"
+    else:
+        prepared_for_name = f"{prepared_for_name} | {client_name}"
 
-    for idx, item in enumerate(line_items):
-        r = 10 + idx
-        ws.cell(row=r, column=1, value=idx + 1)
-        ws.cell(row=r, column=2, value=item["product"])
-        ws.cell(row=r, column=3, value=item["type"])
-        ws.cell(row=r, column=4, value=item["unit_price"])
-        ws.cell(row=r, column=5, value=item["volume"])
-        ws.cell(row=r, column=6, value=item["uom"])
-        ws.cell(row=r, column=7, value=item["revenue"])
+    # ── Yellow cells: Dynamic values ──
 
-    tr = 10 + len(line_items)
-    ws.cell(row=tr, column=2, value="TOTAL")
-    ws.cell(row=tr, column=7, value=total_revenue)
+    # H4: Quotation number
+    ws["H4"] = q_number
 
-    tc = tr + 2
-    ws[f"A{tc}"] = "Terms & Conditions"
-    for i, term in enumerate([
-        "1. Payment terms: Net 30 days from invoice date.",
-        "2. Prices are in USD and exclude applicable taxes.",
-        "3. Recurring fees are billed monthly based on actual volume.",
-        "4. Implementation fee is billed upon project kickoff.",
-        "5. This quotation is valid for 30 days from the date of issue.",
-    ]):
-        ws[f"A{tc + 1 + i}"] = term
-    ws[f"A{tc + 7}"] = "Prepared by: Sembuh AI Sales Team"
-    ws[f"A{tc + 8}"] = f"Date: {TODAY_STR}"
+    # I5: Date (yellow)
+    ws["I5"] = TODAY.strftime("%B %d, %Y")
+
+    # I6: Valid until (yellow)
+    ws["I6"] = (TODAY + datetime.timedelta(days=30)).strftime("%B %d, %Y")
+
+    # B7: Prepared For (yellow) — client contact from MoM
+    ws["B7"] = f"Prepared For:\n\n{prepared_for_name}\n\n"
+
+    # B10: Project description (yellow) — from MoM context + CRM data
+    products_list = []
+    if has_ocr:
+        products_list.append("OCR")
+    if has_fwa:
+        products_list.append("FWA")
+    if has_stp:
+        products_list.append("STP")
+    modules_str = " + ".join(products_list) or products_str
+
+    desc = f"AI-Powered Claims Processing Solution — {modules_str} modules for {client_name}.\n"
+    desc += f"Scope: {members:,} active members, ~{monthly_vol:,} claims/month (IP {int(ip_ratio*100)}% / OP {int(op_ratio*100)}%)."
+    if mom_context:
+        # Add PoC reference if available
+        if "PoC" in mom_context or "poc" in mom_context.lower():
+            desc += f"\nFollowing successful PoC review."
+    if discount_pct:
+        desc += f"\n{discount_pct}% commercial discount applied per client request."
+    ws["B10"] = desc
+
+    # I12: OCR monthly cost (yellow)
+    ws["I12"] = ocr_monthly if has_ocr else 0
+
+    # I13: FWA monthly cost (yellow)
+    ws["I13"] = fwa_monthly if has_fwa else 0
+
+    # I14: STP monthly cost (yellow)
+    ws["I14"] = stp_monthly if has_stp else 0
+
+    # I15: Implementation fee (yellow)
+    ws["I15"] = impl_fee
+
+    # I16-I19: formulas already in template (monthly subtotal, annual, impl, gross)
+    # I20: Discount row — update formula based on actual discount
+    if discount_pct:
+        ws["I20"] = f"=I19*-{discount_pct/100}"
+        ws["B20"] = f"Discount ({discount_pct}%)"
+    else:
+        ws["I20"] = 0
+        ws["B20"] = "Discount (0%)"
+
+    # I21-I22: formulas already in template (grand total, effective monthly)
+
+    # B23: Discount note (yellow)
+    if discount_pct and discount_note:
+        ws["B23"] = f"Discount: {discount_pct}% — {discount_note}"
+    elif discount_pct:
+        ws["B23"] = f"Discount: {discount_pct}% applied per commercial negotiation."
+    else:
+        ws["B23"] = ""
+
+    # B33: Terms & Conditions — update members/volume references
+    terms = ws["B33"].value or ""
+    terms = terms.replace("62,000", f"{members:,}")
+    terms = terms.replace("4,200", f"{monthly_vol:,}")
+    if discount_pct:
+        # Update discount reference in T&C
+        terms = terms.replace("10% discount", f"{discount_pct}% discount")
+    else:
+        # Remove discount T&C clause if no discount
+        lines = terms.split("\n")
+        lines = [l for l in lines if "discount" not in l.lower() or "threshold" in l.lower()]
+        terms = "\n".join(lines)
+    ws["B33"] = terms
+
+    # ── Sheet 2: ROI & Discount Rules — update dynamic values ──
+    if "ROI & Discount Rules" in wb.sheetnames:
+        ws2 = wb["ROI & Discount Rules"]
+        ws2["H1"] = members  # Member all
+        ws2["H2"] = members  # Members active
+        ws2["H5"] = annual_vol  # Annual claims
+        ws2["H6"] = annual_vol  # Claims all
+        incurred = deal.get("incurred", 0)
+        if incurred:
+            ws2["B4"] = incurred * fx if incurred < 1e9 else incurred  # Yearly incurred IDR
+        # Update discount rules — Sentosa Applied row
+        if discount_pct:
+            ws2["B30"] = f"Applied: {discount_pct}% total discount. {discount_note or 'Per commercial negotiation.'}"
 
     safe_name = re.sub(r'[^\w\s-]', '', client_name).strip().replace(' ', '_')
     out_path = os.path.join(OUTPUT_DIR, safe_name, f"Sembuh AI - {client_name} - Quotation v1.xlsx")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     wb.save(out_path)
-    print(f"    Quotation: {out_path}")
+    print(f"    Quotation: {out_path}" + (f" (discount {discount_pct}%)" if discount_pct else ""))
     return out_path
 
 
-def generate_pricing_internal(deal, all_deals):
+def generate_pricing_internal(deal, all_deals, discount_pct=0, discount_note=""):
     import openpyxl
 
     template_path = os.path.join(TEMPLATE_DIR, "Hackathon_Pricing Internal.xlsx")
     wb = openpyxl.load_workbook(template_path)
     client_name = deal["name"]
     products = deal["products"]
+    discount_mult = 1 - (discount_pct / 100) if discount_pct else 1.0
 
     # --- Sheet 1: Per-Client ---
     ws1 = wb.worksheets[0]
@@ -381,17 +458,23 @@ def generate_pricing_internal(deal, all_deals):
     _unmerge_and_clear(ws1)
 
     ws1["A1"], ws1["H1"] = "Per Client Gross Profit", f"Date {TODAY_STR}"
-    for col, hdr in enumerate(["Client", "Status", "Total Revenue ($)", "Blended Margin %", "Cost of Revenue ($)", "Gross Profit ($)"]):
+    hdrs1 = ["Client", "Status", "Total Revenue ($)", "Blended Margin %", "Cost of Revenue ($)", "Gross Profit ($)"]
+    if discount_pct:
+        hdrs1.extend(["Discount %", "Discount Note"])
+    for col, hdr in enumerate(hdrs1):
         ws1.cell(row=2, column=col + 1, value=hdr)
 
     total_rev = sum(
-        MARGIN_ASSUMPTIONS[p]["unit_price"] * (1 if p == "Implementation" else deal["annual_claim_vol"])
+        MARGIN_ASSUMPTIONS[p]["unit_price"] * discount_mult * (1 if p == "Implementation" else deal["annual_claim_vol"])
         for p in products
     )
     blended_margin = round(sum(MARGIN_ASSUMPTIONS[p]["margin"] for p in products) / len(products), 2) if products else 0.60
 
     ws1["A3"], ws1["B3"], ws1["C3"], ws1["D3"] = client_name, deal["stage"], round(total_rev, 2), blended_margin
     ws1["E3"], ws1["F3"] = "=C3*(1-D3)", "=C3*D3"
+    if discount_pct:
+        ws1["G3"] = f"{discount_pct}%"
+        ws1["H3"] = discount_note or ""
 
     # --- Sheet 2: Margin Summary ---
     ws2 = wb.worksheets[1] if len(wb.worksheets) > 1 else wb.create_sheet("Margin Summary")
@@ -458,20 +541,31 @@ def generate_pricing_internal(deal, all_deals):
     _unmerge_and_clear(ws4)
     ws4["A1"] = "Sembuh AI — Per Client Product & Pricing Detail"
     ws4["A2"] = "Annual revenue breakdown per client"
+    if discount_pct:
+        ws4["A3"] = f"** Discount {discount_pct}% applied to {client_name}: {discount_note or 'per client request'} **"
 
-    for col, hdr in enumerate(["Client", "Product", "Type", "Unit Price ($)", "Annual Vol", "UoM", "Revenue ($)", "Notes", "Margin %", "Cost ($)", "GP ($)"]):
+    for col, hdr in enumerate(["Client", "Product", "Type", "Unit Price ($)", "Discount %", "Discounted Price ($)", "Annual Vol", "UoM", "Revenue ($)", "Notes", "Margin %", "Cost ($)", "GP ($)"]):
         ws4.cell(row=4, column=col + 1, value=hdr)
 
     detail_notes = {"Claim Workflow": "AI claim workflow", "Fraud Detection": "FWA detection", "Implementation": "Core system integration"}
     row_num = 5
     for d in all_deals:
+        is_discounted = discount_pct and d["name"] == client_name
+        d_mult = discount_mult if is_discounted else 1.0
+        d_pct = discount_pct if is_discounted else 0
         for p in d["products"]:
             info = MARGIN_ASSUMPTIONS[p]
             vol = 1 if p == "Implementation" else d["annual_claim_vol"]
+            unit_price = info["unit_price"]
+            disc_price = unit_price * d_mult
             ws4[f"A{row_num}"], ws4[f"B{row_num}"], ws4[f"C{row_num}"] = d["name"], p, info["type"]
-            ws4[f"D{row_num}"], ws4[f"E{row_num}"], ws4[f"F{row_num}"] = info["unit_price"], vol, info["uom"]
-            ws4[f"G{row_num}"], ws4[f"H{row_num}"], ws4[f"I{row_num}"] = f"=D{row_num}*E{row_num}", detail_notes.get(p, ""), info["margin"]
-            ws4[f"J{row_num}"], ws4[f"K{row_num}"] = f"=G{row_num}*(1-I{row_num})", f"=G{row_num}*I{row_num}"
+            ws4[f"D{row_num}"] = unit_price
+            ws4[f"E{row_num}"] = f"{d_pct}%" if d_pct else "-"
+            ws4[f"F{row_num}"] = round(disc_price, 2)
+            ws4[f"G{row_num}"], ws4[f"H{row_num}"] = vol, info["uom"]
+            ws4[f"I{row_num}"] = f"=F{row_num}*G{row_num}"
+            ws4[f"J{row_num}"], ws4[f"K{row_num}"] = detail_notes.get(p, ""), info["margin"]
+            ws4[f"L{row_num}"], ws4[f"M{row_num}"] = f"=I{row_num}*(1-K{row_num})", f"=I{row_num}*K{row_num}"
             row_num += 1
 
     safe_name = re.sub(r'[^\w\s-]', '', client_name).strip().replace(' ', '_')
@@ -482,44 +576,11 @@ def generate_pricing_internal(deal, all_deals):
     return out_path
 
 
-def generate_proposal(deal):
-    from pptx import Presentation
-
-    template_path = os.path.join(TEMPLATE_DIR, "Sembuh AI_Proposal.pptx")
-    prs = Presentation(template_path)
-    client_name = deal["name"]
-
-    replacements = {
-        "[Placeholder DD/Month/YYYY]": TODAY_STR,
-        "DD/Month/YYYY": TODAY_STR,
-        "Placeholder DD/Month/YYYY": TODAY_STR,
-        "BNI Life": client_name,
-        "BNI LIfe": client_name,
-        "BNI LIFE": client_name.upper(),
-    }
-
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    for run in para.runs:
-                        for old, new in replacements.items():
-                            if old in run.text:
-                                run.text = run.text.replace(old, new)
-            if shape.has_table:
-                for row in shape.table.rows:
-                    for cell in row.cells:
-                        for para in cell.text_frame.paragraphs:
-                            for run in para.runs:
-                                for old, new in replacements.items():
-                                    if old in run.text:
-                                        run.text = run.text.replace(old, new)
-
-    safe_name = re.sub(r'[^\w\s-]', '', client_name).strip().replace(' ', '_')
-    out_path = os.path.join(OUTPUT_DIR, safe_name, f"Sembuh AI - {client_name} - Proposal v1.pptx")
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    prs.save(out_path)
-    print(f"    Proposal:  {out_path}")
+def generate_proposal(deal, discount_pct=0, discount_note="", mom_context=""):
+    """Generate proposal using the full dynamic replacement logic from generate_docs."""
+    sys.path.insert(0, _BASE_DIR)
+    from generate_docs import generate_proposal as _gen_proposal
+    out_path = _gen_proposal(deal, discount_pct=discount_pct, discount_note=discount_note, mom_context=mom_context)
     return out_path
 
 
@@ -558,41 +619,45 @@ def upload_to_drive(files, client_name):
 # GMAIL DRAFT
 # ══════════════════════════════════════════════════════════════
 
-def create_email_draft(deal, files):
+def create_email_draft(deal, files, discount_pct=0, discount_note=""):
     _, _, gmail_create_draft = _get_google_tools()
 
     client_name = deal["name"]
     products_str = ", ".join(deal["products"])
+    owner_name = deal.get("owner") or "Indi Bintang"
+    monthly_vol = int(deal["monthly_claim_vol"] or 0)
+    members = int(deal["members_covered"] or 0)
 
-    subject = f"Sembuh AI — Proposal for {client_name} ({products_str})"
-    body = f"""Dear {client_name} Team,
+    discount_paragraph = ""
+    if discount_pct:
+        discount_paragraph = f"""
+As discussed, we have applied a {discount_pct}% discount to the proposed commercial terms{(' (' + discount_note + ')') if discount_note else ''}. The updated pricing is reflected in the attached quotation.
+"""
 
-Thank you for your interest in Sembuh AI's solutions. Please find attached our proposal and quotation.
+    subject = f"Re: Commercial Proposal — {client_name}"
+    body = f"""Hi,
 
-Proposal Summary:
-- Client: {client_name}
-- Solutions: {products_str}
-- Stage: {deal['stage']}
-- Monthly Claim Volume: {int(deal['monthly_claim_vol']):,}
-- Members Covered: {int(deal['members_covered']):,}
+Thank you for your time during our recent discussion. We appreciate the opportunity to work with {client_name} and the valuable feedback from your team.
+{discount_paragraph}
+Following our conversation, please find attached our updated proposal and quotation for your review:
 
-Attached:
-1. Proposal — Solutions overview and implementation plan
-2. Quotation — Detailed pricing breakdown
+1. Proposal — Covers our recommended solution ({products_str}), implementation approach, and expected outcomes tailored to your operations.
+2. Quotation — Detailed pricing breakdown based on your current volume ({monthly_vol:,} claims/month, {members:,} members covered).
 
-Implementation Plan:
-- Week 1: Setup and requirements alignment
-- Week 2: API integration with core system
-- Week 3: Testing and UAT
-- Week 4: Go-live and monitoring
+Implementation Overview:
+- Week 1: Project kickoff, requirements alignment, and environment setup
+- Week 2: API integration with your core claims system
+- Week 3: End-to-end testing and UAT with your team
+- Week 4: Go-live, monitoring, and handover
+
+We're confident that Sembuh AI can deliver meaningful improvements to your claims processing workflow. We'd be happy to walk through the proposal in more detail or adjust any terms to align with your requirements.
+
+Please don't hesitate to reach out if you have any questions or need any clarification. We look forward to your response and the opportunity to move forward together.
 
 Best regards,
-Sembuh AI Sales Team
+{owner_name}
+Sembuh AI
 www.sembuh.ai
-
----
-Auto-generated draft — review before sending.
-Generated on {TODAY_STR}
 """
 
     result = gmail_create_draft(
@@ -644,7 +709,7 @@ def _health_label(score):
 
 
 def slack_managerial_report(deals, generated_files=None, drive_links=None, draft_links=None):
-    """Managerial report → #bod-updates style (Section 4.1 of spec)."""
+    """Managerial report → #bod-updates (structured card format)."""
     drive_links = drive_links or {}
     draft_links = draft_links or {}
 
@@ -654,89 +719,174 @@ def slack_managerial_report(deals, generated_files=None, drive_links=None, draft
     active = [d for d in deals if d["stage"] not in ("Lost",)]
     total_value = sum(d["deal_value"] for d in active)
     weighted = sum(d["deal_value"] * STAGE_WEIGHTS.get(d["stage"], 0.1) for d in active)
-    prob_pct = int((weighted / total_value * 100) if total_value else 0)
+    prob_pct = (weighted / total_value * 100) if total_value else 0
 
-    # Health distribution
-    healthy = [(d, s) for d, s, st, r in scored if st == "Healthy"]
-    at_risk = [(d, s) for d, s, st, r in scored if st == "At Risk"]
-    critical = [(d, s) for d, s, st, r in scored if st == "Critical"]
-    lost = [(d, s) for d, s, st, r in scored if st == "Lost"]
+    at_risk_deals = [(d, s, r) for d, s, st, r in scored if st == "At Risk"]
+    critical_deals = [(d, s, r) for d, s, st, r in scored if st == "Critical"]
+    healthy_deals = [(d, s) for d, s, st, r in scored if st == "Healthy" and d["stage"] not in ("Won", "Implementation Done", "[Won] Waiting Signature")]
 
-    healthy_val = sum(d["deal_value"] for d, _ in healthy)
-    at_risk_val = sum(d["deal_value"] for d, _ in at_risk)
-    critical_val = sum(d["deal_value"] for d, _ in critical)
-    lost_val = sum(d["deal_value"] for d, _ in lost)
+    day_display = TODAY.strftime("%B %d, %Y")
 
-    # Build message
-    lines = [
-        f":bar_chart:  *Weekly Pipeline Report — {TODAY_STR}*",
-        "",
-        "*Pipeline Overview*",
-        f"│  Total Active Deals:   {len(active)}",
-        f"│  Total Pipeline Value:  ${total_value:,.0f}",
-        f"│  Weighted Forecast:     ${weighted:,.0f} ({prob_pct}% probability)",
-        "",
-        "*Health Distribution*",
-        f":large_green_circle:  Healthy:    {len(healthy)} deal{'s' if len(healthy) != 1 else ''}  (${healthy_val:,.0f})",
-        f":warning:  At Risk:    {len(at_risk)} deal{'s' if len(at_risk) != 1 else ''}  (${at_risk_val:,.0f})",
-        f":red_circle:  Critical:   {len(critical)} deal{'s' if len(critical) != 1 else ''}  (${critical_val:,.0f})",
-        f":white_circle:  Lost:       {len(lost)} deal{'s' if len(lost) != 1 else ''}  (${lost_val:,.0f})",
+    # ── Block 1: Header ──
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "WEEKLY PIPELINE REPORT"}},
+        {"type": "context", "elements": [
+            {"type": "mrkdwn", "text": f":calendar:  {day_display}  |  Sembuh AI | Sales Intelligence Engine"},
+        ]},
+        {"type": "divider"},
     ]
 
-    # Deals requiring attention (score < 80, sorted by score asc)
-    attention = [(d, s, r) for d, s, st, r in scored if st in ("At Risk", "Critical")]
-    attention.sort(key=lambda x: x[1])
-    if attention:
-        lines.append("")
-        lines.append(":rotating_light:  *Deals Requiring Attention*")
-        for i, (d, score, reasons) in enumerate(attention[:5]):
-            emoji = _health_emoji(score)
-            reason_str = "; ".join(reasons)
-            owner_str = f"Owner: {d['owner']}" if d["owner"] else "Owner: Unassigned"
-            lines.append(f"{i+1}. *{d['name']}* (${d['deal_value']:,.0f})")
-            lines.append(f"   Score: {score}/100 {emoji} | {d['stage']} | {owner_str}")
-            lines.append(f"   :arrow_right: {reason_str}")
+    # ── Block 2: Pipeline Overview ──
+    overview = "\n".join([
+        "*PIPELINE OVERVIEW*",
+        "```",
+        f"{'Metric':<22} Value",
+        f"{'-'*35}",
+        f"{'Active Deals':<22} {len(active)}",
+        f"{'Total Pipeline':<22} ${total_value:,.0f}",
+        f"{'Weighted Forecast':<22} ${weighted:,.0f} ({prob_pct:.1f}%)",
+        f"{'Deals at Risk':<22} {len(at_risk_deals)}",
+        f"{'Critical Deals':<22} {len(critical_deals)}",
+        "```",
+    ])
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": overview}})
 
-    # Positive signals
-    positive = [(d, s) for d, s, st, r in scored if st == "Healthy" and d["stage"] not in ("Won", "Implementation Done")]
-    if positive:
-        lines.append("")
-        lines.append(":white_check_mark:  *Positive Signals*")
-        for d, score in positive:
-            lines.append(f"• {d['name']} — {d['stage']}, on track (score {score}/100)")
+    # ── Block 3: Deal Summary Table ──
+    table_lines = [
+        "*DEAL SUMMARY*",
+        "```",
+        f"{'Deal':<30} {'Stage':<20} {'Value':>10} {'Score':>7} {'Status':<10}",
+        f"{'-'*80}",
+    ]
+    # Sort by score asc (worst first)
+    sorted_scored = sorted(scored, key=lambda x: x[1])
+    for d, score, status, reasons in sorted_scored:
+        if status == "Lost":
+            continue
+        stage_short = d["stage"][:18]
+        st_label = status.upper()
+        table_lines.append(f"{d['name'][:29]:<30} {stage_short:<20} ${d['deal_value']:>8,.0f} {score:>5}   {st_label:<10}")
+    table_lines.append("```")
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(table_lines)}})
+    blocks.append({"type": "divider"})
 
-    # AI Insight
-    stuck_stages = {}
-    for d in active:
-        stuck_stages[d["stage"]] = stuck_stages.get(d["stage"], 0) + 1
-    most_stuck = max(stuck_stages, key=stuck_stages.get) if stuck_stages else None
-    if most_stuck and stuck_stages[most_stuck] > 1:
-        lines.append("")
-        lines.append(f":bulb: *AI Insight:* {stuck_stages[most_stuck]} deals at _{most_stuck}_ stage. Consider accelerating follow-up cadence.")
+    # ── Block 4: Critical Deals ──
+    for d, score, reasons in critical_deals:
+        last_activity = _parse_date(d.get("last_contact")) or _parse_date(d.get("updated_at"))
+        days_ago = f"{(TODAY - last_activity).days} days ago" if last_activity else "Unknown"
+        reason_action = reasons[0] if reasons else "Review immediately"
+        card = "\n".join([
+            ":red_circle: *CRITICAL DEAL*",
+            f"```",
+            f"{'Deal':<22} {d['name']}",
+            f"{'Value':<22} ${d['deal_value']:,.0f}",
+            f"{'Score':<22} {score}/100",
+            f"{'Stage':<22} {d['stage']}",
+            f"{'Last Activity':<22} {days_ago}",
+            f"{'Required Action':<22} {reason_action}",
+            f"{'Owner':<22} {d['owner'] or 'Unassigned'}",
+            f"```",
+        ])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": card}})
 
-    # Generated files section
+    # ── Block 5: At Risk Deals ──
+    if at_risk_deals:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ":warning: *DEALS AT RISK*"}})
+        for d, score, reasons in at_risk_deals:
+            close = _parse_date(d.get("close_date"))
+            close_info = ""
+            if close:
+                days_left = (close - TODAY).days
+                if days_left > 0:
+                    close_info = f"{'Close Date':<22} {close.strftime('%B %d')} ({days_left} days remaining)\n"
+                else:
+                    close_info = f"{'Close Date':<22} {close.strftime('%B %d')} (OVERDUE)\n"
+
+            last_activity = _parse_date(d.get("last_contact")) or _parse_date(d.get("updated_at"))
+            stage_info = d["stage"]
+            if last_activity:
+                days_in = (TODAY - last_activity).days
+                if days_in > 0:
+                    stage_info = f"{d['stage']} ({days_in} days)"
+
+            gap_line = ""
+            for r in reasons:
+                if "proposal" in r.lower():
+                    gap_line = f"{'Gap':<22} Proposal not submitted\n"
+                    break
+
+            reason_action = reasons[0] if reasons else "Follow up this week"
+            card = "\n".join(filter(None, [
+                f"```",
+                f"{'Deal':<22} {d['name']}",
+                f"{'Value':<22} ${d['deal_value']:,.0f}",
+                f"{'Score':<22} {score}/100",
+                f"{close_info.rstrip()}" if close_info else None,
+                f"{'Stage':<22} {stage_info}",
+                f"{gap_line.rstrip()}" if gap_line else None,
+                f"{'Required Action':<22} {reason_action}",
+                f"{'Owner':<22} {d['owner'] or 'Unassigned'}",
+                f"```",
+            ]))
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": card}})
+
+    # ── Block 6: Positive Signals ──
+    if healthy_deals:
+        blocks.append({"type": "divider"})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": ":white_check_mark: *POSITIVE SIGNALS*"}})
+        for d, score in healthy_deals:
+            card = "\n".join([
+                f"```",
+                f"{'Deal':<22} {d['name']}",
+                f"{'Status':<22} On track",
+                f"{'Progress':<22} {d['stage']} — score {score}/100",
+                f"```",
+            ])
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": card}})
+
+    # ── Block 7: AI Insight ──
+    # Find stages with multiple stalling deals
+    early_stages = ("Open", "First Meeting Done", "Solutioning")
+    stalling = [d for d in active if d["stage"] in early_stages]
+    stalling_stages = set(d["stage"] for d in stalling)
+    if len(stalling) >= 2:
+        blocks.append({"type": "divider"})
+        stages_str = ", ".join(sorted(stalling_stages))
+        insight = "\n".join([
+            ":bulb: *AI INSIGHT*",
+            f"```",
+            f"{'Observation':<22} {len(stalling)} of {len(active)} deals stalling at early stages",
+            f"{'Affected Stages':<22} {stages_str}",
+            f"{'Recommendation':<22} Implement 7-day follow-up SLA post First Meeting",
+            f"{'Objective':<22} Improve conversion and maintain momentum",
+            f"```",
+        ])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": insight}})
+
+    # ── Block 8: Generated files + links ──
     if generated_files:
-        lines.append("")
-        lines.append(":page_facing_up: *Documents Generated*")
+        blocks.append({"type": "divider"})
+        file_lines = [":page_facing_up: *DOCUMENTS GENERATED*"]
         for deal, files in zip(deals, generated_files):
             if files:
                 file_names = ", ".join(f"`{os.path.basename(f)}`" for f in files)
-                lines.append(f"• {deal['name']}: {file_names}")
+                file_lines.append(f"• {deal['name']}: {file_names}")
                 link_parts = []
                 if deal["name"] in drive_links:
                     link_parts.append(f"<{drive_links[deal['name']]}|:file_folder: Google Drive>")
                 if deal["name"] in draft_links:
                     link_parts.append(f"<{draft_links[deal['name']]}|:envelope: Gmail Draft>")
                 if link_parts:
-                    lines.append(f"   {' · '.join(link_parts)}")
+                    file_lines.append(f"   {' · '.join(link_parts)}")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(file_lines)}})
 
-    lines.append("")
-    lines.append(f"<@{SLACK_NOTIFY_USER}>")
-    lines.append("_Powered by Sales Intelligence Engine_")
+    # ── Footer ──
+    blocks.append({"type": "divider"})
+    blocks.append({"type": "context", "elements": [
+        {"type": "mrkdwn", "text": f"<@{SLACK_NOTIFY_USER}> | _Powered by Sales Intelligence Engine_"},
+    ]})
 
-    text = "\n".join(lines)
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-    return _slack_post(SLACK_CHANNEL_ID, f"<@{SLACK_NOTIFY_USER}> Weekly Pipeline Report — {TODAY_STR}", blocks)
+    return _slack_post(SLACK_CHANNEL_BOD, f"<@{SLACK_NOTIFY_USER}> Weekly Pipeline Report — {TODAY_STR}", blocks)
 
 
 def slack_staff_report(deals, am_name=None, drive_links=None, draft_links=None):
@@ -821,7 +971,7 @@ def slack_staff_report(deals, am_name=None, drive_links=None, draft_links=None):
 
     text = "\n".join(lines)
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-    return _slack_post(SLACK_CHANNEL_ID, f"<@{SLACK_NOTIFY_USER}> Daily briefing for {display_name}", blocks)
+    return _slack_post(SLACK_CHANNEL_AM, f"<@{SLACK_NOTIFY_USER}> Daily briefing for {display_name}", blocks)
 
 
 def slack_critical_alert(deal, score, reasons):
@@ -845,7 +995,7 @@ def slack_critical_alert(deal, score, reasons):
     ])
 
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-    return _slack_post(SLACK_CHANNEL_ID, f":rotating_light: Critical: {deal['name']} — {score}/100", blocks)
+    return _slack_post(SLACK_CHANNEL_AM, f":rotating_light: Critical: {deal['name']} — {score}/100", blocks)
 
 
 def slack_deal_activity(deal, event_summary, agent_actions, next_step, drive_url=None, draft_url=None):
@@ -876,14 +1026,32 @@ def slack_deal_activity(deal, event_summary, agent_actions, next_step, drive_url
     ])
 
     blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]
-    return _slack_post(SLACK_CHANNEL_ID, f":incoming_envelope: Activity: {deal['name']}", blocks)
+    return _slack_post(SLACK_CHANNEL_AM, f":incoming_envelope: Activity: {deal['name']}", blocks)
 
 
 # ══════════════════════════════════════════════════════════════
 # DEAL HEALTH SCORING
 # ══════════════════════════════════════════════════════════════
 
+def _parse_date(s):
+    """Parse date string (ISO or Monday.com format) to datetime.date, or None."""
+    if not s:
+        return None
+    # Handle ISO datetime with timezone (e.g. "2026-04-24T10:30:00Z")
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.datetime.strptime(s[:25], fmt.replace("%z", "")).date()
+        except (ValueError, IndexError):
+            continue
+    try:
+        return datetime.date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
 def compute_health_score(deal):
+    """Health scoring per Developer Handoff Package Section 4."""
     score = 100
     reasons = []
     stage = deal["stage"]
@@ -893,38 +1061,56 @@ def compute_health_score(deal):
     if stage in ("Won", "Implementation Done", "[Won] Waiting Signature"):
         return 100, "Healthy", ["Deal won."]
 
-    # No owner
-    if not deal["owner"]:
+    # ── Rule 1 & 2: No activity in 7+ / 14+ days (mutually exclusive, take worst) ──
+    last_activity = _parse_date(deal.get("last_contact")) or _parse_date(deal.get("updated_at"))
+    if last_activity:
+        days_inactive = (TODAY - last_activity).days
+        if days_inactive >= 14:
+            score -= 50
+            reasons.append(f"No activity in {days_inactive} days (critical — deal going cold)")
+        elif days_inactive >= 7:
+            score -= 30
+            reasons.append(f"No activity in {days_inactive} days")
+
+    # ── Rule 3: Stuck in same stage 21+ days ──
+    # Use updated_at as proxy for stage change date
+    stage_date = _parse_date(deal.get("updated_at"))
+    if stage_date:
+        days_in_stage = (TODAY - stage_date).days
+        if days_in_stage >= 21:
+            score -= 25
+            reasons.append(f"Stuck in {stage} for {days_in_stage} days")
+
+    # ── Rule 4: Expected close date passed ──
+    close = _parse_date(deal.get("close_date"))
+    if close and close < TODAY:
+        score -= 20
+        reasons.append(f"Close date {deal['close_date']} has passed")
+
+    # ── Rule 5: No owner assigned ──
+    if not deal.get("owner"):
         score -= 15
-        reasons.append("No owner assigned")
+        reasons.append("No owner assigned — orphaned deal")
 
-    # No deal value
-    if deal["deal_value"] == 0:
+    # ── Rule 6: Deal value empty ──
+    if deal.get("deal_value", 0) == 0:
         score -= 10
-        reasons.append("Deal value empty")
+        reasons.append("Deal value empty — can't forecast")
 
-    # Close date passed
-    if deal["close_date"]:
-        try:
-            close = datetime.date.fromisoformat(deal["close_date"])
-            if close < TODAY:
-                score -= 20
-                reasons.append(f"Close date {deal['close_date']} has passed")
-        except ValueError:
-            pass
-
-    # No proposal for advanced stages
-    advanced = ("Solutioning", "Waiting Confirmation", "[Won] Waiting Signature")
-    if stage in advanced and not deal["proposal_date"]:
+    # ── Rule 7: No proposal sent (Solutioning+ stages) ──
+    advanced = ("Solutioning", "Waiting Confirmation", "[Won] Waiting Signature", "Piloting")
+    if stage in advanced and not deal.get("proposal_date"):
         score -= 10
-        reasons.append(f"Stage is {stage} but no proposal sent")
+        reasons.append(f"Stage is {stage} but no proposal on file")
 
-    # High excess rate
-    if deal["incurred"] > 0:
-        excess_rate = deal["excess"] / deal["incurred"]
+    # ── Rule 8: High excess rate (>30%) ──
+    incurred = deal.get("incurred", 0)
+    excess = deal.get("excess", 0)
+    if incurred > 0:
+        excess_rate = excess / incurred
         if excess_rate > 0.30:
             score -= 10
-            reasons.append(f"High excess rate ({excess_rate:.0%})")
+            reasons.append(f"High excess rate ({excess_rate:.0%}) — claim rejection risk")
 
     score = max(score, 0)
     if score >= 80:
@@ -935,6 +1121,523 @@ def compute_health_score(deal):
         status = "Critical"
 
     return score, status, reasons
+
+
+# ══════════════════════════════════════════════════════════════
+# SQLite DATABASE
+# ══════════════════════════════════════════════════════════════
+
+def _init_db():
+    """Initialize SQLite database with deals + action_histories tables."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deals (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            stage TEXT,
+            deal_value REAL DEFAULT 0,
+            close_date TEXT,
+            monthly_claim_vol REAL DEFAULT 0,
+            annual_claim_vol REAL DEFAULT 0,
+            members_covered REAL DEFAULT 0,
+            pricing_model TEXT,
+            incurred REAL DEFAULT 0,
+            excess REAL DEFAULT 0,
+            approved REAL DEFAULT 0,
+            op_pct REAL DEFAULT 0,
+            ip_pct REAL DEFAULT 0,
+            owner TEXT,
+            proposal_date TEXT,
+            products TEXT,
+            health_score INTEGER DEFAULT 0,
+            health_status TEXT,
+            health_reasons TEXT,
+            synced_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS action_histories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deal_id TEXT,
+            deal_name TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            description TEXT,
+            draft_link TEXT,
+            drive_link TEXT,
+            files_generated TEXT,
+            mom_file TEXT,
+            discount_pct REAL DEFAULT 0,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            processed_at TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _sync_deals_to_db():
+    """Fetch deals from Monday.com, compute health, store in SQLite. Returns deal list."""
+    boards = fetch_boards()
+    deals_board = find_deals_board(boards)
+    if not deals_board:
+        raise RuntimeError("No Deals board found")
+
+    raw_deals = fetch_deals(deals_board["id"])
+    deals = [parse_deal(d) for d in raw_deals]
+    now = datetime.datetime.now().isoformat()
+
+    conn = _init_db()
+    for deal in deals:
+        score, status, reasons = compute_health_score(deal)
+        deal["health_score"] = score
+        deal["health_status"] = status
+        deal["health_reasons"] = reasons
+
+        conn.execute("""
+            INSERT OR REPLACE INTO deals
+            (id, name, stage, deal_value, close_date, monthly_claim_vol, annual_claim_vol,
+             members_covered, pricing_model, incurred, excess, approved, op_pct, ip_pct,
+             owner, proposal_date, products, health_score, health_status, health_reasons, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            deal["id"], deal["name"], deal["stage"], deal["deal_value"],
+            deal["close_date"], deal["monthly_claim_vol"], deal["annual_claim_vol"],
+            deal["members_covered"], deal["pricing_model"], deal["incurred"],
+            deal["excess"], deal["approved"], deal.get("op_pct", 0), deal.get("ip_pct", 0),
+            deal["owner"], deal.get("proposal_date", ""),
+            json.dumps(deal["products"]),
+            score, status, json.dumps(reasons), now,
+        ))
+    conn.commit()
+    conn.close()
+    return deals, now
+
+
+def _get_deals_from_db():
+    """Read all deals from SQLite, return list of dicts."""
+    conn = _init_db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM deals ORDER BY health_score ASC").fetchall()
+    conn.close()
+    deals = []
+    for row in rows:
+        d = dict(row)
+        d["products"] = json.loads(d["products"]) if d["products"] else []
+        d["health_reasons"] = json.loads(d["health_reasons"]) if d["health_reasons"] else []
+        deals.append(d)
+    return deals
+
+
+def _log_action(deal, action_type, description, draft_link="", drive_link="",
+                files_generated=None, mom_file="", discount_pct=0):
+    """Insert action history record."""
+    conn = _init_db()
+    now = datetime.datetime.now().isoformat()
+    conn.execute("""
+        INSERT INTO action_histories
+        (deal_id, deal_name, action_type, description, draft_link, drive_link,
+         files_generated, mom_file, discount_pct, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    """, (
+        deal.get("id", ""), deal["name"], action_type, description,
+        draft_link, drive_link,
+        json.dumps(files_generated or []), mom_file, discount_pct, now,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def _get_pending_actions():
+    """Get all unprocessed action histories."""
+    conn = _init_db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM action_histories WHERE status = 'pending' ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    actions = []
+    for row in rows:
+        d = dict(row)
+        d["files_generated"] = json.loads(d["files_generated"]) if d["files_generated"] else []
+        actions.append(d)
+    return actions
+
+
+def _get_all_actions(limit=50):
+    """Get recent action histories (all statuses)."""
+    conn = _init_db()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT * FROM action_histories ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    actions = []
+    for row in rows:
+        d = dict(row)
+        d["files_generated"] = json.loads(d["files_generated"]) if d["files_generated"] else []
+        actions.append(d)
+    return actions
+
+
+def _mark_action_done(action_id):
+    """Mark action history as processed."""
+    conn = _init_db()
+    now = datetime.datetime.now().isoformat()
+    conn.execute(
+        "UPDATE action_histories SET status = 'done', processed_at = ? WHERE id = ?",
+        (now, action_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_dashboard_data(deals):
+    """Build full dashboard payload from deal list."""
+    active = [d for d in deals if d["stage"] not in ("Lost",)]
+    lost = [d for d in deals if d["stage"] == "Lost"]
+
+    total_value = sum(d["deal_value"] for d in active)
+    weighted = sum(d["deal_value"] * STAGE_WEIGHTS.get(d["stage"], 0.1) for d in active)
+    prob_pct = int((weighted / total_value * 100) if total_value else 0)
+
+    healthy = [d for d in deals if d["health_status"] == "Healthy"]
+    at_risk = [d for d in deals if d["health_status"] == "At Risk"]
+    critical = [d for d in deals if d["health_status"] == "Critical"]
+
+    # Find worst critical deal for alert subtitle
+    critical_subtitle = ""
+    if critical:
+        worst = min(critical, key=lambda d: d["health_score"])
+        reasons = worst["health_reasons"]
+        critical_subtitle = f"{worst['name']} — {reasons[0]}" if reasons else worst["name"]
+
+    # KPI
+    kpi = {
+        "total_pipeline": total_value,
+        "active_deals": len(active),
+        "weighted_pipeline": weighted,
+        "conversion_probability": prob_pct,
+        "at_risk_count": len(at_risk),
+        "critical_count": len(critical),
+        "critical_subtitle": critical_subtitle,
+    }
+
+    # Deal health table
+    deal_table = []
+    for d in deals:
+        deal_table.append({
+            "name": d["name"],
+            "stage": d["stage"],
+            "value": d["deal_value"],
+            "score": d["health_score"],
+            "status": d["health_status"],
+            "reasons": d["health_reasons"],
+            "owner": d["owner"],
+            "close_date": d["close_date"],
+        })
+
+    # Pipeline by stage
+    stage_groups = {}
+    for d in deals:
+        s = d["stage"]
+        if s not in stage_groups:
+            stage_groups[s] = {"value": 0, "count": 0}
+        stage_groups[s]["value"] += d["deal_value"]
+        stage_groups[s]["count"] += 1
+
+    max_val = max((v["value"] for v in stage_groups.values()), default=1)
+    pipeline_stages = []
+    for stage, info in sorted(stage_groups.items(), key=lambda x: x[1]["value"]):
+        pipeline_stages.append({
+            "stage": stage,
+            "value": info["value"],
+            "count": info["count"],
+            "pct": round(info["value"] / max_val * 100) if max_val else 0,
+        })
+
+    # AI actions
+    actions = []
+    scored = [(d, d["health_score"], d["health_status"], d["health_reasons"]) for d in deals]
+    scored.sort(key=lambda x: x[1])
+    for d, score, status, reasons in scored:
+        if status == "Lost":
+            continue
+        if status == "Critical":
+            actions.append({
+                "priority": "urgent",
+                "text": reasons[0] if reasons else f"{d['name']} needs immediate attention",
+                "deal": f"{d['name']} • ${d['deal_value']:,.0f}",
+            })
+        elif status == "At Risk":
+            actions.append({
+                "priority": "warning",
+                "text": reasons[0] if reasons else f"{d['name']} at risk",
+                "deal": f"{d['name']} • ${d['deal_value']:,.0f}",
+            })
+        else:
+            actions.append({
+                "priority": "info",
+                "text": "On track — continue current engagement",
+                "deal": f"{d['name']} • ${d['deal_value']:,.0f}",
+            })
+
+    # Revenue forecast (bar chart data)
+    revenue_forecast = {
+        "labels": [],
+        "deal_values": [],
+        "weighted_values": [],
+    }
+    for d in active:
+        short = d["name"][:20]
+        weight = STAGE_WEIGHTS.get(d["stage"], 0.1)
+        revenue_forecast["labels"].append(short)
+        revenue_forecast["deal_values"].append(d["deal_value"])
+        revenue_forecast["weighted_values"].append(round(d["deal_value"] * weight))
+
+    # Health distribution (doughnut)
+    health_distribution = {
+        "labels": ["Healthy (80-100)", "At Risk (50-79)", "Critical (<50)", "Lost"],
+        "values": [len(healthy), len(at_risk), len(critical), len(lost)],
+    }
+
+    # AI narrative
+    narrative_parts = [
+        f"Total active pipeline stands at ${total_value:,.0f} across {len(active)} deals"
+        f" (excluding {len(lost)} lost).",
+        f"Weighted forecast is ${weighted:,.0f} based on stage probabilities ({prob_pct}% conversion).",
+    ]
+    if critical:
+        names = ", ".join(d["name"] for d in critical)
+        narrative_parts.append(f"Critical: {names} — require immediate action.")
+    if at_risk:
+        names = ", ".join(d["name"] for d in at_risk)
+        narrative_parts.append(f"At risk: {names} — monitor closely this week.")
+    if healthy:
+        names = ", ".join(d["name"] for d in healthy)
+        narrative_parts.append(f"Positive: {names} — progressing well.")
+
+    synced_at = deals[0].get("synced_at", "") if deals else ""
+
+    return {
+        "kpi": kpi,
+        "deals": deal_table,
+        "pipeline_stages": pipeline_stages,
+        "actions": actions,
+        "revenue_forecast": revenue_forecast,
+        "health_distribution": health_distribution,
+        "narrative": " ".join(narrative_parts),
+        "synced_at": synced_at,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# FLASK API SERVER
+# ══════════════════════════════════════════════════════════════
+
+def create_app():
+    """Create Flask app with API endpoints."""
+    from flask import Flask, jsonify, request, send_from_directory
+    from flask_cors import CORS
+
+    app = Flask(__name__, static_folder=os.path.join(_BASE_DIR, "PTP Hackathon - Brief"))
+    CORS(app)
+
+    @app.route("/api/sync", methods=["POST"])
+    def api_sync():
+        """Sync deals from Monday.com → SQLite."""
+        try:
+            deals, synced_at = _sync_deals_to_db()
+            return jsonify({
+                "status": "ok",
+                "deals_synced": len(deals),
+                "synced_at": synced_at,
+            })
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/api/dashboard", methods=["GET"])
+    def api_dashboard():
+        """Get dashboard data from SQLite."""
+        deals = _get_deals_from_db()
+        if not deals:
+            return jsonify({"status": "empty", "message": "No data. Call POST /api/sync first."}), 404
+        data = _build_dashboard_data(deals)
+        return jsonify(data)
+
+    @app.route("/api/actions", methods=["GET"])
+    def api_actions():
+        """Get action histories. ?status=pending for unprocessed only."""
+        status_filter = request.args.get("status", "")
+        if status_filter == "pending":
+            actions = _get_pending_actions()
+        else:
+            actions = _get_all_actions()
+        return jsonify({"actions": actions, "total": len(actions)})
+
+    @app.route("/api/actions/<int:action_id>/done", methods=["POST"])
+    def api_action_done(action_id):
+        """Mark action as processed."""
+        _mark_action_done(action_id)
+        return jsonify({"status": "ok", "id": action_id})
+
+    @app.route("/api/pipeline", methods=["GET"])
+    def api_pipeline():
+        """Run pipeline for a deal. Params: ?deal=Sentosa&mom_path=optional"""
+        deal_filter = request.args.get("deal", "")
+        mom_path = request.args.get("mom_path", "")
+
+        try:
+            result = _run_pipeline_core(deal_filter=deal_filter, docx_path=mom_path)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    @app.route("/")
+    def index():
+        return send_from_directory(_BASE_DIR, "dashboard.html")
+
+    return app
+
+
+def _run_pipeline_core(deal_filter="", docx_path=""):
+    """Core pipeline logic: fetch deals → generate docs → Drive → Gmail → Slack → log actions.
+    Returns result dict. Used by both CLI cmd_pipeline and API /api/pipeline.
+    """
+    result = {"status": "ok", "steps": [], "deals_processed": 0, "files_generated": 0}
+
+    # ── STEP 1: MoM extraction (optional) ──
+    mom_text = None
+    discount_pct = 0
+    discount_note = ""
+    mom_context = ""
+
+    if docx_path and os.path.exists(docx_path):
+        print(f"  Extracting MoM: {docx_path}")
+        mom_text = extract_docx_text(docx_path)
+        result["steps"].append(f"MoM extracted ({len(mom_text)} chars)")
+
+        # Extract metadata
+        meta = extract_mom_metadata(mom_text)
+        discount_pct = meta.get("discount_pct") or 0
+        discount_note = meta.get("discount_note") or ""
+        mom_context = meta.get("mom_context") or ""
+        if discount_pct:
+            result["steps"].append(f"Discount detected: {discount_pct}%")
+
+    # ── STEP 2: Fetch deals ──
+    boards = fetch_boards()
+    deals_board = find_deals_board(boards)
+    if not deals_board:
+        raise RuntimeError("No Deals board found")
+
+    raw_deals = fetch_deals(deals_board["id"])
+    all_deals = [parse_deal(d) for d in raw_deals]
+
+    deals = all_deals
+    if deal_filter:
+        deals = [d for d in all_deals if deal_filter.lower() in d["name"].lower()]
+        if not deals:
+            raise RuntimeError(f"No deal matching '{deal_filter}'")
+
+    result["deals_processed"] = len(deals)
+    result["steps"].append(f"Fetched {len(deals)} deal(s) from Monday.com")
+
+    # ── STEP 3: Generate docs ──
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    all_files = []
+    for i, deal in enumerate(deals):
+        print(f"  [{deal['name']}] generating docs...")
+        files = [
+            generate_quotation(deal, seq_num=i + 1, discount_pct=discount_pct, discount_note=discount_note),
+            generate_pricing_internal(deal, deals, discount_pct=discount_pct, discount_note=discount_note),
+            generate_proposal(deal, discount_pct=discount_pct, discount_note=discount_note, mom_context=mom_context),
+        ]
+        all_files.append(files)
+
+    total_files = sum(len(f) for f in all_files)
+    result["files_generated"] = total_files
+    result["steps"].append(f"Generated {total_files} documents")
+
+    # ── STEP 4: Upload to Google Drive ──
+    drive_links = {}
+    for deal, files in zip(deals, all_files):
+        try:
+            _, drive_url = upload_to_drive(files, deal["name"])
+            drive_links[deal["name"]] = drive_url
+        except Exception as e:
+            print(f"    Drive error ({deal['name']}): {e}")
+    if drive_links:
+        result["steps"].append(f"Uploaded to Google Drive ({len(drive_links)} deals)")
+
+    # ── STEP 5: Gmail drafts ──
+    draft_links = {}
+    for deal, files in zip(deals, all_files):
+        if deal["stage"] == "Lost":
+            continue
+        try:
+            draft_id = create_email_draft(deal, files, discount_pct=discount_pct, discount_note=discount_note)
+            if draft_id:
+                draft_links[deal["name"]] = f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"
+        except Exception as e:
+            print(f"    Gmail error ({deal['name']}): {e}")
+    if draft_links:
+        result["steps"].append(f"Gmail drafts created ({len(draft_links)} deals)")
+
+    # ── STEP 6: Log action histories ──
+    for deal, files in zip(deals, all_files):
+        file_basenames = [os.path.basename(f) for f in files]
+        draft_link = draft_links.get(deal["name"], "")
+        drive_link = drive_links.get(deal["name"], "")
+        desc_parts = []
+        if files:
+            desc_parts.append(f"Generated {len(files)} documents")
+        if drive_link:
+            desc_parts.append("Uploaded to Google Drive")
+        if draft_link:
+            desc_parts.append("Gmail draft created")
+        if discount_pct:
+            desc_parts.append(f"Discount {discount_pct}% applied")
+        description = ". ".join(desc_parts) + "." if desc_parts else "Pipeline executed."
+
+        _log_action(
+            deal=deal,
+            action_type="pipeline",
+            description=description,
+            draft_link=draft_link,
+            drive_link=drive_link,
+            files_generated=file_basenames,
+            mom_file=os.path.basename(docx_path) if mom_text else "",
+            discount_pct=discount_pct,
+        )
+    result["steps"].append(f"Logged {len(deals)} action(s)")
+
+    # ── STEP 7: Sync deals to DB ──
+    _sync_deals_to_db()
+    result["steps"].append("Synced deals to dashboard DB")
+
+    # ── STEP 8: Slack notifications ──
+    try:
+        slack_managerial_report(all_deals, all_files, drive_links=drive_links, draft_links=draft_links)
+        owners = set(d["owner"] for d in all_deals if d["owner"])
+        for owner in owners:
+            slack_staff_report(all_deals, am_name=owner, drive_links=drive_links, draft_links=draft_links)
+        if not owners:
+            slack_staff_report(all_deals, drive_links=drive_links, draft_links=draft_links)
+        for deal in all_deals:
+            score, status, reasons = compute_health_score(deal)
+            if score < 50 and status == "Critical":
+                slack_critical_alert(deal, score, reasons)
+        result["steps"].append("Slack notifications sent")
+    except Exception as e:
+        result["steps"].append(f"Slack error: {e}")
+
+    # ── Result summary ──
+    result["drive_links"] = drive_links
+    result["draft_links"] = draft_links
+    result["deal_names"] = [d["name"] for d in deals]
+
+    return result
 
 
 # ══════════════════════════════════════════════════════════════
@@ -953,6 +1656,38 @@ def extract_docx_text(filepath):
         for row in table.rows:
             parts.append(" | ".join(cell.text.strip() for cell in row.cells))
     return "\n".join(parts)
+
+
+def extract_mom_metadata(mom_text):
+    """Extract discount, context summary, and other commercial metadata from MoM using Claude."""
+    anthropic = Anthropic()
+    resp = anthropic.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=512,
+        messages=[{"role": "user", "content": f"""\
+Extract commercial metadata from this meeting notes / email. Return ONLY valid JSON:
+
+--- TEXT ---
+{mom_text}
+--- END ---
+
+{{
+  "discount_pct": <number 0-100 or null if no discount mentioned>,
+  "discount_note": "<reason for discount or null>",
+  "mom_context": "<1-2 sentence summary of key outcomes, decisions, and next steps from this meeting — suitable for including in a proposal document>",
+  "client_contact_name": "<name of the main client contact/stakeholder mentioned or null>",
+  "client_contact_title": "<job title of the client contact or null>",
+  "client_company": "<client company name or null>"
+}}
+"""}],
+    )
+    raw = resp.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"discount_pct": None, "discount_note": None, "mom_context": None, "client_contact_name": None, "client_contact_title": None, "client_company": None}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -974,15 +1709,16 @@ def cmd_generate(args):
 
     print(f"  Board: {deals_board['name']} (id: {deals_board['id']})")
     raw_deals = fetch_deals(deals_board["id"])
-    deals = [parse_deal(d) for d in raw_deals]
+    all_deals = [parse_deal(d) for d in raw_deals]
 
-    # Filter by --deal if specified
+    # Filter by --deal for doc generation, keep all_deals for reporting
+    deals = all_deals
     if args.deal:
-        deals = [d for d in deals if args.deal.lower() in d["name"].lower()]
+        deals = [d for d in all_deals if args.deal.lower() in d["name"].lower()]
         if not deals:
             print(f"  No deal matching '{args.deal}'"); sys.exit(1)
 
-    print(f"  Processing {len(deals)} deals")
+    print(f"  Processing {len(deals)} deals (total in CRM: {len(all_deals)})")
 
     # 2. Generate docs
     print("\n[2/5] Generating documents...")
@@ -1020,16 +1756,16 @@ def cmd_generate(args):
         except Exception as e:
             print(f"    Gmail error ({deal['name']}): {e}")
 
-    # 5. Slack — managerial + staff reports
+    # 5. Slack — managerial uses ALL deals, staff/critical use filtered
     print("\n[5/5] Sending Slack reports...")
     try:
-        slack_managerial_report(deals, all_files, drive_links=drive_links, draft_links=draft_links)
-        owners = set(d["owner"] for d in deals if d["owner"])
+        slack_managerial_report(all_deals, all_files, drive_links=drive_links, draft_links=draft_links)
+        owners = set(d["owner"] for d in all_deals if d["owner"])
         for owner in owners:
-            slack_staff_report(deals, am_name=owner, drive_links=drive_links, draft_links=draft_links)
+            slack_staff_report(all_deals, am_name=owner, drive_links=drive_links, draft_links=draft_links)
         if not owners:
-            slack_staff_report(deals, drive_links=drive_links, draft_links=draft_links)
-        for deal in deals:
+            slack_staff_report(all_deals, drive_links=drive_links, draft_links=draft_links)
+        for deal in all_deals:
             score, status, reasons = compute_health_score(deal)
             if score < 50 and status == "Critical":
                 slack_critical_alert(deal, score, reasons)
@@ -1198,6 +1934,29 @@ Instructions:
             print(f"\n  CRM update error: {e}")
             print("  Continuing with document generation...\n")
 
+    # ── Extract discount + context + client contact from MoM ──
+    discount_pct = 0
+    discount_note = ""
+    mom_context = ""
+    client_contact_name = ""
+    client_contact_title = ""
+    if mom_text:
+        print("\n  Extracting commercial metadata from MoM...")
+        meta = extract_mom_metadata(mom_text)
+        discount_pct = meta.get("discount_pct") or 0
+        discount_note = meta.get("discount_note") or ""
+        mom_context = meta.get("mom_context") or ""
+        client_contact_name = meta.get("client_contact_name") or ""
+        client_contact_title = meta.get("client_contact_title") or ""
+        if discount_pct:
+            print(f"  Discount detected: {discount_pct}% — {discount_note}")
+        else:
+            print("  No discount mentioned in MoM.")
+        if client_contact_name:
+            print(f"  Client contact: {client_contact_name}" + (f" ({client_contact_title})" if client_contact_title else ""))
+        if mom_context:
+            print(f"  MoM context: {mom_context}")
+
     # ── STEP 2: Generate Documents (Point 2 & 3) ─────────────
     print(f"\n{'='*60}")
     print("STEP 2/3 — Document Generation")
@@ -1211,29 +1970,31 @@ Instructions:
 
     print(f"  Board: {deals_board['name']} (id: {deals_board['id']})")
     raw_deals = fetch_deals(deals_board["id"])
-    deals = [parse_deal(d) for d in raw_deals]
+    all_deals = [parse_deal(d) for d in raw_deals]
 
+    # Filter for doc generation, keep all_deals for reporting
+    deals = all_deals
     if args.deal:
-        deals = [d for d in deals if args.deal.lower() in d["name"].lower()]
+        deals = [d for d in all_deals if args.deal.lower() in d["name"].lower()]
         if not deals:
             print(f"  No deal matching '{args.deal}'"); sys.exit(1)
 
-    print(f"  Processing {len(deals)} deals\n")
+    print(f"  Generating docs for {len(deals)} deal(s) (total in CRM: {len(all_deals)})\n")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     all_files = []
     for i, deal in enumerate(deals):
         print(f"  [{deal['name']}] ({deal['stage']})")
         files = [
-            generate_quotation(deal, seq_num=i + 1),
-            generate_pricing_internal(deal, deals),
-            generate_proposal(deal),
+            generate_quotation(deal, seq_num=i + 1, discount_pct=discount_pct, discount_note=discount_note, client_contact_name=client_contact_name, client_contact_title=client_contact_title, mom_context=mom_context),
+            generate_pricing_internal(deal, deals, discount_pct=discount_pct, discount_note=discount_note),
+            generate_proposal(deal, discount_pct=discount_pct, discount_note=discount_note, mom_context=mom_context),
         ]
         all_files.append(files)
 
     # Upload to Google Drive
     print("\n  Uploading to Google Drive...")
-    drive_links = {}  # deal_name -> drive_url
+    drive_links = {}
     for deal, files in zip(deals, all_files):
         try:
             _, drive_url = upload_to_drive(files, deal["name"])
@@ -1243,28 +2004,57 @@ Instructions:
 
     # Gmail drafts
     print("\n  Creating Gmail drafts...")
-    draft_links = {}  # deal_name -> gmail_url
+    draft_links = {}
     for deal, files in zip(deals, all_files):
         if deal["stage"] == "Lost":
             print(f"    Skip {deal['name']} (Lost)"); continue
         try:
-            draft_id = create_email_draft(deal, files)
+            draft_id = create_email_draft(deal, files, discount_pct=discount_pct, discount_note=discount_note)
             if draft_id:
                 draft_links[deal["name"]] = f"https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"
         except Exception as e:
             print(f"    Gmail error ({deal['name']}): {e}")
+
+    # ── Log action histories ──
+    print("\n  Logging action histories...")
+    for deal, files in zip(deals, all_files):
+        file_basenames = [os.path.basename(f) for f in files]
+        draft_link = draft_links.get(deal["name"], "")
+        drive_link = drive_links.get(deal["name"], "")
+        desc_parts = []
+        if files:
+            desc_parts.append(f"Generated {len(files)} documents")
+        if drive_link:
+            desc_parts.append("Uploaded to Google Drive")
+        if draft_link:
+            desc_parts.append("Gmail draft created")
+        if discount_pct:
+            desc_parts.append(f"Discount {discount_pct}% applied")
+        description = ". ".join(desc_parts) + "." if desc_parts else "Pipeline executed."
+
+        _log_action(
+            deal=deal,
+            action_type="pipeline",
+            description=description,
+            draft_link=draft_link,
+            drive_link=drive_link,
+            files_generated=file_basenames,
+            mom_file=os.path.basename(docx_path) if mom_text else "",
+            discount_pct=discount_pct,
+        )
+    print(f"  {len(deals)} action(s) logged.")
 
     # ── STEP 3: Health Check & Slack Notification ─────────────
     print(f"\n{'='*60}")
     print("STEP 3/3 — Health Check & Notifications")
     print("=" * 60)
 
-    # Health scores
+    # Health scores for ALL deals
     print("\n  Deal Health Scores:")
     print(f"  {'Deal':<35} {'Score':>5} {'Status':<10} Reasons")
     print(f"  {'-'*85}")
     critical_deals = []
-    for deal in deals:
+    for deal in all_deals:
         score, status, reasons = compute_health_score(deal)
         reason_str = "; ".join(reasons) if reasons else "On track"
         ind = {"Healthy": "G", "At Risk": "A", "Critical": "R", "Lost": "X"}.get(status, "?")
@@ -1272,20 +2062,20 @@ Instructions:
         if score < 50:
             critical_deals.append((deal, score, reasons))
 
-    # Slack reports (per spec)
+    # Slack reports — managerial/staff always use ALL deals
     print("\n  Sending Slack reports...")
 
-    # 1. Managerial report (#bod-updates style)
-    slack_managerial_report(deals, all_files, drive_links=drive_links, draft_links=draft_links)
+    # 1. Managerial report — all deals
+    slack_managerial_report(all_deals, all_files, drive_links=drive_links, draft_links=draft_links)
 
-    # 2. Staff reports per AM
-    owners = set(d["owner"] for d in deals if d["owner"])
+    # 2. Staff reports per AM — all deals
+    owners = set(d["owner"] for d in all_deals if d["owner"])
     for owner in owners:
-        slack_staff_report(deals, am_name=owner, drive_links=drive_links, draft_links=draft_links)
+        slack_staff_report(all_deals, am_name=owner, drive_links=drive_links, draft_links=draft_links)
     if not owners:
-        slack_staff_report(deals, drive_links=drive_links, draft_links=draft_links)
+        slack_staff_report(all_deals, drive_links=drive_links, draft_links=draft_links)
 
-    # 3. Critical alerts
+    # 3. Critical alerts — all deals
     for deal, score, reasons in critical_deals:
         slack_critical_alert(deal, score, reasons)
 
@@ -1317,7 +2107,7 @@ Instructions:
     print(f"  Deals:     {len(deals)}")
     print(f"  Files:     {sum(len(f) for f in all_files)}")
     print(f"  Output:    {OUTPUT_DIR}")
-    print(f"  Slack:     {SLACK_CHANNEL_ID}")
+    print(f"  Slack:     {SLACK_CHANNEL_BOD} (#bod-updates), {SLACK_CHANNEL_AM} (#am-indi)")
     print("=" * 60)
 
 
@@ -1399,6 +2189,11 @@ Examples:
     # interactive
     sub.add_parser("interactive", help="Interactive Monday.com assistant")
 
+    # serve
+    srv = sub.add_parser("serve", help="Start API server for dashboard")
+    srv.add_argument("--port", type=int, default=5005, help="Port (default 5005)")
+    srv.add_argument("--host", default="0.0.0.0", help="Host (default 0.0.0.0)")
+
     args = parser.parse_args()
 
     if args.command == "pipeline":
@@ -1411,6 +2206,12 @@ Examples:
         cmd_health(args)
     elif args.command == "interactive":
         cmd_interactive(args)
+    elif args.command == "serve":
+        app = create_app()
+        print(f"Dashboard: http://localhost:{args.port}")
+        print(f"API sync:  POST http://localhost:{args.port}/api/sync")
+        print(f"API data:  GET  http://localhost:{args.port}/api/dashboard")
+        app.run(host=args.host, port=args.port, debug=True)
     else:
         parser.print_help()
 

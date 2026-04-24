@@ -221,83 +221,46 @@ def generate_quotation(deal, seq_num=1):
     q_number = f"SBH-Q-{TODAY.year}-{seq_num:03d}"
     validity_date = (TODAY + datetime.timedelta(days=30)).strftime("%d %B %Y")
 
-    # Build line items from products
     products = deal["products"]
-    line_items = []
-    total_revenue = 0
+    products_str = ", ".join(products)
+    monthly_vol = int(deal["monthly_claim_vol"] or 0)
+    annual_vol = int(deal["annual_claim_vol"] or monthly_vol * 12)
+    members = int(deal["members_covered"] or monthly_vol * 10)
 
-    for prod_name in products:
-        info = MARGIN_ASSUMPTIONS[prod_name]
-        if prod_name == "Implementation":
-            vol = 1
-            unit_price = info["unit_price"]
-        else:
-            vol = deal["annual_claim_vol"] if deal["annual_claim_vol"] > 0 else deal["monthly_claim_vol"] * 12
-            unit_price = info["unit_price"]
-        revenue = unit_price * vol
-        total_revenue += revenue
-        line_items.append({
-            "product": prod_name,
-            "type": info["type"],
-            "unit_price": unit_price,
-            "volume": vol,
-            "uom": info["uom"],
-            "revenue": revenue,
-        })
+    # Compute PMPM cost
+    recurring_rate = sum(MARGIN_ASSUMPTIONS[p]["unit_price"] for p in products if p != "Implementation")
+    impl_fee = MARGIN_ASSUMPTIONS["Implementation"]["unit_price"] if "Implementation" in products else 0
+    total_annual = recurring_rate * annual_vol + impl_fee
+    pmpm = total_annual / members / 12 if members > 0 else 0
 
-    # Unmerge all cells then clear
-    for merge in list(ws.merged_cells.ranges):
-        ws.unmerge_cells(str(merge))
+    # Replace placeholders in-place (preserve formatting, merges, layout)
     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=ws.max_column):
         for cell in row:
-            cell.value = None
+            if cell.value is None:
+                continue
+            val = str(cell.value)
+            if "[Placeholder" not in val and "Placeholder" not in val and "~900,000" not in val and "~72,000" not in val:
+                continue
+            val = val.replace("[Placeholder Name]", deal.get("owner", "Account Manager"))
+            val = val.replace("[Placeholder Client]", client_name)
+            val = val.replace("[Placeholder Full Address]", "")
+            val = val.replace("Placeholder DD/Month/YYYY", TODAY_STR)
+            val = val.replace("[Placeholder DD/Month/YYYY]", TODAY_STR)
+            if val.strip() in ("[Placeholder]", "[Placeholder] "):
+                if cell.row == 10:
+                    val = f"{products_str} for {client_name}"
+                elif cell.column == 9:  # Cost column (I)
+                    val = f"IDR {pmpm * 16000:,.0f}" if pmpm > 0 else "Per Claim"
+                else:
+                    val = client_name
+            val = val.replace("~900,000 members", f"~{members:,} members")
+            val = val.replace("~72,000 claims", f"~{annual_vol:,} claims")
+            cell.value = val
 
-    # Header
-    ws["A1"] = "SEMBUH AI — QUOTATION"
-    ws["A3"] = "Client:"
-    ws["B3"] = client_name
-    ws["A4"] = "Date:"
-    ws["B4"] = TODAY_STR
-    ws["A5"] = "Quotation No:"
-    ws["B5"] = q_number
-    ws["A6"] = "Validity:"
-    ws["B6"] = f"30 days (until {validity_date})"
-    ws["A7"] = "Pricing Model:"
-    ws["B7"] = deal["pricing_model"]
-
-    # Line items table
-    ws["A9"] = "No"
-    ws["B9"] = "Product / Service"
-    ws["C9"] = "Type"
-    ws["D9"] = "Unit Price ($)"
-    ws["E9"] = "Volume"
-    ws["F9"] = "UoM"
-    ws["G9"] = "Total ($)"
-
-    for idx, item in enumerate(line_items):
-        row = 10 + idx
-        ws[f"A{row}"] = idx + 1
-        ws[f"B{row}"] = item["product"]
-        ws[f"C{row}"] = item["type"]
-        ws[f"D{row}"] = item["unit_price"]
-        ws[f"E{row}"] = item["volume"]
-        ws[f"F{row}"] = item["uom"]
-        ws[f"G{row}"] = item["revenue"]
-
-    total_row = 10 + len(line_items)
-    ws[f"B{total_row}"] = "TOTAL"
-    ws[f"G{total_row}"] = total_revenue
-
-    # Terms
-    tc_row = total_row + 2
-    ws[f"A{tc_row}"] = "Terms & Conditions"
-    ws[f"A{tc_row + 1}"] = "1. Payment terms: Net 30 days from invoice date."
-    ws[f"A{tc_row + 2}"] = "2. Prices are in USD and exclude applicable taxes."
-    ws[f"A{tc_row + 3}"] = "3. Recurring fees are billed monthly based on actual volume."
-    ws[f"A{tc_row + 4}"] = "4. Implementation fee is billed upon project kickoff."
-    ws[f"A{tc_row + 5}"] = "5. This quotation is valid for 30 days from the date of issue."
-    ws[f"A{tc_row + 7}"] = "Prepared by: Sembuh AI Sales Team"
-    ws[f"A{tc_row + 8}"] = f"Date: {TODAY_STR}"
+    # Fill header fields
+    ws["H4"] = f"Quotation No: {q_number}"
+    ws["H5"] = f"Date: {TODAY_STR}"
+    ws["H6"] = f"Valid Until: {validity_date}"
 
     safe_name = re.sub(r'[^\w\s-]', '', client_name).strip().replace(' ', '_')
     out_path = os.path.join(OUTPUT_DIR, safe_name, f"Sembuh AI - {client_name} - Quotation v1.xlsx")
@@ -529,7 +492,7 @@ def generate_pricing_internal(deal, all_deals):
 
 # ── Proposal Generator ────────────────────────────────────────
 
-def _compute_proposal_metrics(deal):
+def _compute_proposal_metrics(deal, discount_pct=0):
     """Compute ROI and executive summary metrics from deal data."""
     monthly_vol = deal["monthly_claim_vol"] or 4000
     annual_vol = monthly_vol * 12
@@ -544,14 +507,15 @@ def _compute_proposal_metrics(deal):
     sim_excess = incurred * sim_excess_rate / 100 if incurred > 0 else 0
     containment_value = sim_excess - excess if sim_excess > excess else 0
 
-    # Cost model: per claim pricing
+    # Cost model: per claim pricing (with discount)
+    discount_mult = 1 - (discount_pct / 100) if discount_pct else 1.0
     products = deal["products"]
     has_cw = "Claim Workflow" in products
     has_fd = "Fraud Detection" in products
     has_impl = "Implementation" in products
-    cw_price = 1.0 if has_cw else 0
-    fd_price = 2.0 if has_fd else 0
-    impl_fee = 50000 if has_impl else 0
+    cw_price = 1.0 * discount_mult if has_cw else 0
+    fd_price = 2.0 * discount_mult if has_fd else 0
+    impl_fee = 50000 * discount_mult if has_impl else 0
     annual_recurring = (cw_price + fd_price) * annual_vol
     annual_investment = annual_recurring + impl_fee
 
@@ -595,6 +559,10 @@ def _compute_proposal_metrics(deal):
         "time_before": time_before,
         "time_after": time_after,
         "products": products,
+        "discount_pct": discount_pct,
+        "cw_price": cw_price,
+        "fd_price": fd_price,
+        "impl_fee": impl_fee,
     }
 
 
@@ -607,7 +575,7 @@ def _fmt_idr(val):
     return f"IDR {val:,.0f}"
 
 
-def generate_proposal(deal):
+def generate_proposal(deal, discount_pct=0, discount_note="", mom_context=""):
     """Generate proposal pptx from template, replacing placeholders with deal data."""
     from pptx import Presentation
 
@@ -616,7 +584,7 @@ def generate_proposal(deal):
 
     client_name = deal["name"]
     products_str = ", ".join(deal["products"])
-    m = _compute_proposal_metrics(deal)
+    m = _compute_proposal_metrics(deal, discount_pct=discount_pct)
 
     # --- Build replacement map for text across all slides ---
     replacements = {
@@ -647,17 +615,27 @@ def generate_proposal(deal):
         f"and intelligent cost containment analysis."
     )
 
+    discount_str = ""
+    if discount_pct:
+        discount_str = f" (includes {discount_pct}% discount as agreed)"
+
     benchmark_text = (
         f"Coverage: {m['members']:,} members, ~{m['annual_vol']:,} claims/year. "
-        f"Commercial model: per-claim pricing. "
+        f"Commercial model: per-claim pricing{discount_str}. "
         f"Estimated annual investment: {_fmt_idr(m['annual_inv_idr'])}."
     )
 
-    approach_text = (
-        f"Structured PoC using {client_name} claim samples to validate: "
-        f"(1) OCR extraction quality, (2) Claim Workflow Automation & FWA analysis alignment, "
-        f"and (3) workflow fit. Implementation timeline to be finalized after IT alignment."
-    )
+    if mom_context:
+        approach_text = (
+            f"Based on our recent discussions with {client_name}: {mom_context} "
+            f"Implementation timeline to be finalized after IT alignment."
+        )
+    else:
+        approach_text = (
+            f"Structured PoC using {client_name} claim samples to validate: "
+            f"(1) OCR extraction quality, (2) Claim Workflow Automation & FWA analysis alignment, "
+            f"and (3) workflow fit. Implementation timeline to be finalized after IT alignment."
+        )
 
     placeholder_replacements = {
         # Shape S85 [Placeholder] markers
@@ -667,12 +645,16 @@ def generate_proposal(deal):
     }
 
     # --- Slide 14: Key Executive Summary ROI numbers ---
+    pmpm_label = f"IDR {m['pmpm_idr']:,} per member per month"
+    if discount_pct:
+        pmpm_label += f" ({discount_pct}% discount applied)"
+
     roi_replacements = {
         "~ IDR 61.94B+": f"~ {_fmt_idr(m['total_value'] * 16000)}+",
         "~ IDR 6.934 B": f"~ {_fmt_idr(m['annual_inv_idr'])}",
         "~ 9 x ": f"~ {m['roi_multiple']:.0f} x " if m['roi_multiple'] >= 1 else "< 1 x ",
         "900,000 members and ~72,000 claims/year": f"{m['members']:,} members and ~{m['annual_vol']:,} claims/year",
-        "IDR 650 per member per month [1]": f"IDR {m['pmpm_idr']:,} per member per month",
+        "IDR 650 per member per month [1]": pmpm_label,
         "CNI-QT-26-03-00070": f"Based on {client_name} deal data",
     }
     replacements.update(roi_replacements)
@@ -705,19 +687,18 @@ def generate_proposal(deal):
         for shape in slide.shapes:
             if shape.has_text_frame:
                 for para in shape.text_frame.paragraphs:
-                    for run in para.runs:
+                    runs_list = list(para.runs)
+                    for run_idx, run in enumerate(runs_list):
                         # Replace [Placeholder] markers with dynamic content
                         if run.text.strip() == "[Placeholder]":
-                            # Determine which placeholder based on preceding run text
-                            prev_texts = [r.text for r in para.runs]
-                            combined = "".join(prev_texts)
-                            if "Context & Objective" in combined:
+                            prev_text = runs_list[run_idx - 1].text if run_idx > 0 else ""
+                            if "Context" in prev_text:
                                 run.text = context_text
-                            elif "Scope of Solution" in combined:
+                            elif "Scope" in prev_text:
                                 run.text = scope_text
-                            elif "Reference Benchmark" in combined:
+                            elif "Benchmark" in prev_text or "Reference" in prev_text:
                                 run.text = benchmark_text
-                            elif "Approach" in combined or "Moving Forward" in combined:
+                            elif "Approach" in prev_text or "Moving Forward" in prev_text:
                                 run.text = approach_text
                             else:
                                 run.text = f"See {client_name} proposal details."
