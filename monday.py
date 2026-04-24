@@ -17,7 +17,7 @@ from mcp.client.stdio import stdio_client
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 MONDAY_API_KEY = os.getenv("MONDAY_API_KEY", "")
 MONDAY_WORKSPACE_ID = os.getenv("MONDAY_WORKSPACE_ID", "")
 MONDAY_API_URL = "https://api.monday.com/v2"

@@ -5,3 +5,4 @@
 service_account
 output
 venv
+*.pyc
